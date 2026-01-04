@@ -6,8 +6,8 @@ corpus of ~2.5M papers with full metadata (title, authors, abstract, categories,
 OAI-PMH docs: https://info.arxiv.org/help/oa/index.html
 Rate limit: 3 seconds between requests (arXiv requirement)
 
-This will take 6-12+ hours for a full harvest due to rate limits.
-Progress is saved after each batch so it can resume if interrupted.
+This will take multiple GitHub Actions runs (6 hours each) due to rate limits.
+Progress is saved after each batch so it can resume across runs.
 """
 import xml.etree.ElementTree as ET
 import time
@@ -17,6 +17,9 @@ from pathlib import Path
 from subsets_utils import get, get_data_dir, load_state, save_state
 
 BASE_URL = "https://export.arxiv.org/oai2"
+
+# GitHub Actions time budget (5.8 hours to leave room for cleanup)
+GH_ACTIONS_MAX_RUN_SECONDS = 5.8 * 60 * 60
 
 # OAI-PMH namespaces
 NS = {
@@ -138,11 +141,15 @@ def fetch_batch(resumption_token: str | None = None) -> tuple[list[dict], str | 
     return records, next_token
 
 
-def run():
-    """Harvest all arXiv metadata via OAI-PMH."""
-    print("Harvesting arXiv metadata via OAI-PMH...")
-    print("  This will take 6-12+ hours for full corpus (~2.5M papers)")
+def run() -> bool:
+    """Harvest all arXiv metadata via OAI-PMH.
 
+    Returns:
+        bool: True if more work to do (should re-trigger), False if complete
+    """
+    print("Harvesting arXiv metadata via OAI-PMH...")
+
+    start_time = time.time()
     data_dir = Path(get_data_dir()) / "raw"
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -154,6 +161,8 @@ def run():
 
     if resumption_token:
         print(f"  Resuming from batch {batch_num}, {total_harvested:,} records so far...")
+    else:
+        print("  Starting fresh harvest (~2.5M papers expected)...")
 
     # Output file - append mode with gzip
     output_file = data_dir / "arxiv_metadata.jsonl.gz"
@@ -161,6 +170,13 @@ def run():
 
     with gzip.open(output_file, mode) as f:
         while True:
+            # Check time budget
+            elapsed = time.time() - start_time
+            if elapsed >= GH_ACTIONS_MAX_RUN_SECONDS:
+                print(f"\n  Time budget exhausted after {batch_num} batches ({elapsed/3600:.1f} hours)")
+                print(f"  Progress: {total_harvested:,} records harvested")
+                return True  # Signal continuation needed
+
             batch_num += 1
 
             try:
@@ -190,13 +206,14 @@ def run():
             })
 
             if not next_token:
-                print(f"  Harvest complete! Total: {total_harvested:,} records")
-                break
+                print(f"\n  Harvest complete! Total: {total_harvested:,} records")
+                print(f"  Output: {output_file}")
+                print(f"  Size: {output_file.stat().st_size / 1024 / 1024:.1f} MB")
+                return False  # Complete, no continuation needed
 
             resumption_token = next_token
 
             # Rate limit - arXiv requires 3s between requests
             time.sleep(3)
 
-    print(f"  Output: {output_file}")
-    print(f"  Size: {output_file.stat().st_size / 1024 / 1024:.1f} MB")
+    return False
