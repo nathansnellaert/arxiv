@@ -1,7 +1,7 @@
 import argparse
 from subsets_utils import validate_environment
 
-from ingest import papers as ingest_papers
+from ingest import oai_harvest
 
 
 def main():
@@ -14,7 +14,7 @@ def main():
 
     if not args.transform_only:
         print("\n=== Ingest ===")
-        ingest_papers.run()
+        oai_harvest.run()
 
     if not args.ingest_only:
         print("\n=== Transform ===")
