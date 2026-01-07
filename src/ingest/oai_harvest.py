@@ -15,11 +15,16 @@ import gzip
 import json
 from pathlib import Path
 from subsets_utils import get, get_data_dir, load_state, save_state
+from subsets_utils.r2 import is_cloud_mode, upload_file, get_connector_name, get_bucket_name
 
 BASE_URL = "https://export.arxiv.org/oai2"
 
 # GitHub Actions time budget (5.8 hours to leave room for cleanup)
 GH_ACTIONS_MAX_RUN_SECONDS = 5.8 * 60 * 60
+
+# Upload raw data every N batches (each batch ~1000 records, 3s rate limit)
+# 100 batches = ~5 minutes of harvesting, ~100k records
+UPLOAD_INTERVAL_BATCHES = 100
 
 # OAI-PMH namespaces
 NS = {
@@ -141,6 +146,21 @@ def fetch_batch(resumption_token: str | None = None) -> tuple[list[dict], str | 
     return records, next_token
 
 
+def upload_raw_data(output_file: Path, total_records: int):
+    """Upload the raw data file to R2 if in cloud mode."""
+    if not is_cloud_mode():
+        return
+
+    if not output_file.exists():
+        return
+
+    key = f"{get_connector_name()}/data/raw/arxiv_metadata.jsonl.gz"
+    size_mb = output_file.stat().st_size / 1024 / 1024
+    print(f"  Uploading raw data to R2: {size_mb:.1f} MB, {total_records:,} records...")
+    upload_file(str(output_file), key)
+    print(f"  Uploaded: s3://{get_bucket_name()}/{key}")
+
+
 def run() -> bool:
     """Harvest all arXiv metadata via OAI-PMH.
 
@@ -168,6 +188,8 @@ def run() -> bool:
     output_file = data_dir / "arxiv_metadata.jsonl.gz"
     mode = 'ab' if resumption_token else 'wb'
 
+    needs_continuation = False
+
     with gzip.open(output_file, mode) as f:
         while True:
             # Check time budget
@@ -175,7 +197,8 @@ def run() -> bool:
             if elapsed >= GH_ACTIONS_MAX_RUN_SECONDS:
                 print(f"\n  Time budget exhausted after {batch_num} batches ({elapsed/3600:.1f} hours)")
                 print(f"  Progress: {total_harvested:,} records harvested")
-                return True  # Signal continuation needed
+                needs_continuation = True
+                break
 
             batch_num += 1
 
@@ -189,6 +212,9 @@ def run() -> bool:
                     "total_harvested": total_harvested,
                     "batch_num": batch_num - 1,
                 })
+                # Upload what we have before raising
+                f.close()
+                upload_raw_data(output_file, total_harvested)
                 raise
 
             # Write records
@@ -207,13 +233,16 @@ def run() -> bool:
 
             if not next_token:
                 print(f"\n  Harvest complete! Total: {total_harvested:,} records")
-                print(f"  Output: {output_file}")
-                print(f"  Size: {output_file.stat().st_size / 1024 / 1024:.1f} MB")
-                return False  # Complete, no continuation needed
+                break
 
             resumption_token = next_token
 
             # Rate limit - arXiv requires 3s between requests
             time.sleep(3)
 
-    return False
+    # File closed - upload to R2
+    upload_raw_data(output_file, total_harvested)
+    print(f"  Output: {output_file}")
+    print(f"  Size: {output_file.stat().st_size / 1024 / 1024:.1f} MB")
+
+    return needs_continuation
