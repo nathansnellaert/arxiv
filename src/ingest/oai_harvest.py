@@ -14,6 +14,7 @@ import time
 import gzip
 import json
 from pathlib import Path
+import httpx
 from subsets_utils import get, get_data_dir, load_state, save_state
 from subsets_utils.r2 import is_cloud_mode, upload_file, get_connector_name, get_bucket_name
 
@@ -103,22 +104,39 @@ def parse_arxiv_record(record_elem) -> dict | None:
     return record
 
 
-def fetch_batch(resumption_token: str | None = None) -> tuple[list[dict], str | None]:
-    """Fetch a batch of records from OAI-PMH endpoint."""
+def fetch_batch(resumption_token: str | None = None, max_retries: int = 3) -> tuple[list[dict], str | None]:
+    """Fetch a batch of records from OAI-PMH endpoint.
+
+    Retries on transient errors (timeouts, connection errors) up to max_retries times.
+    """
     if resumption_token:
         url = f"{BASE_URL}?verb=ListRecords&resumptionToken={resumption_token}"
     else:
         # Initial request - use arXiv native format for richest metadata
         url = f"{BASE_URL}?verb=ListRecords&metadataPrefix=arXiv"
 
-    response = get(url, timeout=120)
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = get(url, timeout=120)
+            break
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+            last_error = e
+            wait_time = 30 * (attempt + 1)  # 30s, 60s, 90s
+            print(f"    Attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                print(f"    Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+    else:
+        # All retries exhausted
+        raise last_error
 
     if response.status_code == 503:
         # Server busy, wait and retry
         retry_after = int(response.headers.get('Retry-After', 30))
         print(f"    Server busy, waiting {retry_after}s...")
         time.sleep(retry_after)
-        return fetch_batch(resumption_token)
+        return fetch_batch(resumption_token, max_retries)
 
     if response.status_code != 200:
         raise Exception(f"HTTP {response.status_code}: {response.text[:500]}")
@@ -204,7 +222,20 @@ def run() -> bool:
 
             try:
                 records, next_token = fetch_batch(resumption_token)
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+                # Transient network error after retries exhausted
+                # Save progress and signal continuation (will retry on next run)
+                print(f"  Transient error after retries: {e}")
+                print("  Saving progress for continuation...")
+                save_state("oai_harvest", {
+                    "resumption_token": resumption_token,
+                    "total_harvested": total_harvested,
+                    "batch_num": batch_num - 1,
+                })
+                needs_continuation = True
+                break
             except Exception as e:
+                # Unexpected error - save progress but still crash
                 print(f"  Error fetching batch {batch_num}: {e}")
                 print("  Saving progress and stopping...")
                 save_state("oai_harvest", {
