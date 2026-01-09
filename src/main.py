@@ -3,6 +3,7 @@ import sys
 from subsets_utils import validate_environment
 
 from ingest import oai_harvest
+from transforms import papers
 
 
 def main():
@@ -21,7 +22,7 @@ def main():
 
     if not args.ingest_only:
         print("\n=== Transform ===")
-        print("  (transforms to be added after profiling)")
+        papers.run()
 
     if needs_continuation:
         print("\nExiting with code 2 to signal continuation needed")
