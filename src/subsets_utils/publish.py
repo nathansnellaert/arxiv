@@ -1,14 +1,54 @@
 import json
+import hashlib
 from pathlib import Path
 from deltalake import DeltaTable
 from .environment import get_data_dir, is_cloud_mode
-from .r2 import get_delta_table_uri, get_storage_options
+from .r2 import get_delta_table_uri, get_storage_options, upload_bytes, download_bytes, get_connector_name
 
-def publish(dataset_name: str, metadata: dict):
+
+def _metadata_state_key(dataset_name: str) -> str:
+    return f"{get_connector_name()}/data/state/_metadata_{dataset_name}.json"
+
+
+def _compute_metadata_hash(metadata: dict) -> str:
+    """Compute a stable hash of metadata for change detection."""
+    # Sort keys for consistent hashing
+    serialized = json.dumps(metadata, sort_keys=True)
+    return hashlib.sha256(serialized.encode()).hexdigest()[:16]
+
+
+def sync_metadata(dataset_name: str, metadata: dict) -> bool:
+    """Sync metadata to a Delta table, only if metadata has changed.
+
+    Returns True if metadata was synced, False if no changes detected.
+    """
     if 'id' not in metadata:
         raise ValueError("Missing required field: 'id'")
     if 'title' not in metadata:
         raise ValueError("Missing required field: 'title'")
+
+    # Compute hash of new metadata
+    new_hash = _compute_metadata_hash(metadata)
+
+    # Load existing hash
+    if is_cloud_mode():
+        old_state_bytes = download_bytes(_metadata_state_key(dataset_name))
+        old_state = json.loads(old_state_bytes.decode()) if old_state_bytes else {}
+    else:
+        state_file = Path(get_data_dir()) / "state" / f"_metadata_{dataset_name}.json"
+        old_state = json.load(open(state_file)) if state_file.exists() else {}
+
+    old_hash = old_state.get("hash")
+
+    if old_hash == new_hash:
+        print(f"No metadata changes for {dataset_name} (hash: {new_hash})")
+        return False
+
+    # Metadata has changed, publish it
+    if old_hash:
+        print(f"Syncing metadata for {dataset_name} (hash: {old_hash} -> {new_hash})")
+    else:
+        print(f"Syncing metadata for {dataset_name} (new, hash: {new_hash})")
 
     if is_cloud_mode():
         table_uri = get_delta_table_uri(dataset_name)
@@ -28,4 +68,19 @@ def publish(dataset_name: str, metadata: dict):
             raise ValueError(f"Invalid columns in descriptions: {sorted(invalid)}")
 
     dt.alter.set_table_description(json.dumps(metadata))
-    print(f"Published metadata for {dataset_name}")
+
+    # Save new hash
+    new_state = {"hash": new_hash}
+    if is_cloud_mode():
+        upload_bytes(json.dumps(new_state).encode(), _metadata_state_key(dataset_name))
+    else:
+        state_dir = Path(get_data_dir()) / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_file = state_dir / f"_metadata_{dataset_name}.json"
+        json.dump(new_state, open(state_file, 'w'))
+
+    return True
+
+
+# Keep publish as an alias for backwards compatibility
+publish = sync_metadata

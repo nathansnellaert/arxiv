@@ -5,6 +5,7 @@ import io
 import json
 import gzip
 import uuid
+import hashlib
 from datetime import datetime
 from pathlib import Path
 import pyarrow as pa
@@ -12,31 +13,80 @@ import pyarrow.parquet as pq
 from deltalake import write_deltalake, DeltaTable
 from . import debug
 from .environment import get_data_dir
-from .r2 import is_cloud_mode, upload_bytes, upload_file, download_bytes, get_storage_options, get_delta_table_uri, get_bucket_name, get_connector_name, list_keys
-import fnmatch
+from .r2 import is_cloud_mode, upload_bytes, upload_file, download_bytes, get_storage_options, get_delta_table_uri, get_bucket_name, get_connector_name
+
+
+def _compute_table_hash(table: pa.Table) -> str:
+    """Compute a stable hash of a PyArrow table for change detection."""
+    # Write to parquet bytes for consistent hashing
+    buffer = io.BytesIO()
+    pq.write_table(table, buffer, compression='snappy')
+    return hashlib.sha256(buffer.getvalue()).hexdigest()[:16]
+
+
+def _get_hash_state_key(dataset_name: str) -> str:
+    return f"_hash_{dataset_name}"
+
+
+def sync_data(data: pa.Table, dataset_name: str, mode: str = "overwrite") -> str | None:
+    """Sync a PyArrow table to a Delta table, only if data has changed.
+
+    Returns the table URI if data was synced, None if no changes detected.
+    """
+    if len(data) == 0:
+        print(f"No data to sync for {dataset_name}")
+        return None
+
+    # Compute hash of new data
+    new_hash = _compute_table_hash(data)
+
+    # Load existing hash from state
+    state = load_state(_get_hash_state_key(dataset_name))
+    old_hash = state.get("hash")
+
+    if old_hash == new_hash:
+        print(f"No changes detected for {dataset_name} (hash: {new_hash})")
+        return None
+
+    # Data has changed, upload it
+    size_mb = round(data.nbytes / 1024 / 1024, 2)
+    columns = ', '.join([f.name for f in data.schema])
+    print(f"Syncing {dataset_name}: {len(data)} rows, {len(data.schema)} cols ({columns}), {size_mb} MB")
+    if old_hash:
+        print(f"  Hash changed: {old_hash} -> {new_hash}")
+    else:
+        print(f"  New dataset (hash: {new_hash})")
+
+    if is_cloud_mode():
+        table_uri = get_delta_table_uri(dataset_name)
+        storage_options = get_storage_options()
+    else:
+        table_uri = str(Path(get_data_dir()) / "subsets" / dataset_name)
+        storage_options = None
+
+    write_deltalake(table_uri, data, mode=mode, storage_options=storage_options,
+                    schema_mode="overwrite")
+
+    # Save new hash to state
+    save_state(_get_hash_state_key(dataset_name), {"hash": new_hash})
+
+    # Log output
+    null_counts = {col: data[col].null_count for col in data.column_names if data[col].null_count > 0}
+    debug.log_data_output(dataset_name=dataset_name, row_count=len(data), size_bytes=data.nbytes,
+                          columns=data.column_names, column_count=len(data.schema), null_counts=null_counts, mode=mode)
+    return table_uri
 
 
 # --- Delta table operations ---
 
-def upload_data(data: pa.Table, dataset_name: str, metadata: dict = None, mode: str = "append", merge_key: str = None, partition_by: list[str] = None) -> str:
-    """Upload a PyArrow table to a Delta table.
-
-    Args:
-        data: PyArrow table to upload
-        dataset_name: Name of the dataset/table
-        metadata: Optional metadata dict
-        mode: "append", "overwrite", or "merge"
-        merge_key: Required when mode="merge", column to merge on
-        partition_by: Optional list of columns to partition by (e.g., ["taxonomy", "year"])
-    """
+def upload_data(data: pa.Table, dataset_name: str, metadata: dict = None, mode: str = "append", merge_key: str = None) -> str:
+    """Upload a PyArrow table to a Delta table."""
     if mode not in ("append", "overwrite", "merge"):
         raise ValueError(f"Invalid mode '{mode}'. Must be 'append', 'overwrite', or 'merge'.")
     if mode == "merge" and not merge_key:
         raise ValueError("merge_key is required when mode='merge'")
-    if mode == "merge" and partition_by:
-        raise ValueError("partition_by is not supported with mode='merge'")
     if mode == "overwrite":
-        print(f"Warning: Overwriting {dataset_name} - all existing data will be replaced")
+        print(f"⚠️  Warning: Overwriting {dataset_name} - all existing data will be replaced")
     if len(data) == 0:
         print(f"No data to upload for {dataset_name}")
         return ""
@@ -44,8 +94,7 @@ def upload_data(data: pa.Table, dataset_name: str, metadata: dict = None, mode: 
     size_mb = round(data.nbytes / 1024 / 1024, 2)
     columns = ', '.join([f.name for f in data.schema])
     mode_label = {"append": "Appending to", "overwrite": "Overwriting", "merge": "Merging into"}[mode]
-    partition_info = f", partitioned by {partition_by}" if partition_by else ""
-    print(f"{mode_label} {dataset_name}: {len(data)} rows, {len(data.schema)} cols ({columns}), {size_mb} MB{partition_info}")
+    print(f"{mode_label} {dataset_name}: {len(data)} rows, {len(data.schema)} cols ({columns}), {size_mb} MB")
 
     table_name = metadata.get("title") if metadata else None
     table_description = json.dumps(metadata) if metadata else None
@@ -73,7 +122,6 @@ def upload_data(data: pa.Table, dataset_name: str, metadata: dict = None, mode: 
     else:
         write_deltalake(table_uri, data, mode=mode, storage_options=storage_options,
                         name=table_name, description=table_description,
-                        partition_by=partition_by,
                         schema_mode="merge" if mode == "append" else "overwrite")
 
     # Log output
@@ -272,65 +320,46 @@ def load_raw_parquet(asset_id: str) -> pa.Table:
         return pq.read_table(path)
 
 
-def list_raw_files(pattern: str = "*") -> list[str]:
-    """List raw asset IDs matching a glob pattern.
+def load_raw_parquet_as_dicts(asset_id: str) -> list[dict]:
+    """Load raw Parquet file and return as list of dicts."""
+    table = load_raw_parquet(asset_id)
+    return table.to_pylist()
 
-    Pattern matches against the full asset path (e.g., "prices/*.json", "*.parquet").
-    Returns asset IDs without extensions (e.g., ["prices/bitcoin", "prices/ethereum"]).
 
-    Examples:
-        list_raw_files("prices/*.json")  -> ["prices/bitcoin", "prices/ethereum", ...]
-        list_raw_files("*.parquet")      -> ["page_views_2024-01", "page_views_2024-02", ...]
-        list_raw_files("data_DF_*.csv")  -> ["data_DF_YI", "data_DF_EMP", ...]
-    """
+def raw_exists(asset_id: str, extension: str = "json") -> bool:
+    """Check if a raw asset exists."""
     if is_cloud_mode():
+        data = download_bytes(_raw_key(asset_id, extension))
+        return data is not None
+    else:
+        path = _raw_path(asset_id, extension)
+        return path.exists()
+
+
+def list_raw_files(pattern: str = "*") -> list[str]:
+    """List raw files matching a pattern. Returns asset IDs (without extension)."""
+    import fnmatch
+    if is_cloud_mode():
+        from .r2 import list_keys
         prefix = f"{get_connector_name()}/data/raw/"
-        all_keys = list_keys(prefix)
-        # Strip prefix and match against pattern
-        assets = []
-        for key in all_keys:
-            relative = key[len(prefix):]  # e.g., "prices/bitcoin.json"
-            if fnmatch.fnmatch(relative, pattern):
-                # Remove extension to get asset_id
-                asset_id = relative.rsplit('.', 1)[0]
-                # Handle .json.gz double extension
-                if asset_id.endswith('.json'):
-                    asset_id = asset_id[:-5]
-                assets.append(asset_id)
-        return sorted(assets)
+        keys = list_keys(prefix)
+        # Extract asset IDs from full keys
+        asset_ids = set()
+        for key in keys:
+            # Remove prefix and extension
+            name = key.replace(prefix, "")
+            asset_id = name.rsplit(".", 1)[0] if "." in name else name
+            if fnmatch.fnmatch(asset_id, pattern):
+                asset_ids.add(asset_id)
+        return sorted(asset_ids)
     else:
         raw_dir = Path(get_data_dir()) / "raw"
         if not raw_dir.exists():
             return []
-        # Glob locally
-        matches = list(raw_dir.glob(pattern))
-        assets = []
-        for path in matches:
-            relative = path.relative_to(raw_dir)
-            asset_id = str(relative).rsplit('.', 1)[0]
-            if asset_id.endswith('.json'):
-                asset_id = asset_id[:-5]
-            assets.append(asset_id)
-        return sorted(assets)
-
-
-def raw_exists(asset_id: str, extension: str = None) -> bool:
-    """Check if a raw asset exists.
-
-    If extension is None, checks for common extensions (json, json.gz, parquet, csv).
-    """
-    extensions = [extension] if extension else ["json", "json.gz", "parquet", "csv"]
-
-    if is_cloud_mode():
-        for ext in extensions:
-            key = _raw_key(asset_id, ext)
-            data = download_bytes(key)
-            if data is not None:
-                return True
-        return False
-    else:
-        for ext in extensions:
-            path = Path(get_data_dir()) / "raw" / f"{asset_id}.{ext}"
-            if path.exists():
-                return True
-        return False
+        asset_ids = set()
+        for path in raw_dir.iterdir():
+            if path.is_file():
+                asset_id = path.stem.rsplit(".", 1)[0] if ".json" in path.name or ".parquet" in path.name else path.stem
+                if fnmatch.fnmatch(asset_id, pattern):
+                    asset_ids.add(asset_id)
+        return sorted(asset_ids)

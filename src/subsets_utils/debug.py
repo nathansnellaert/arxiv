@@ -65,15 +65,23 @@ def log_http_request(method, url, status_code, duration_ms=None, error=None, **k
 
 
 def log_data_output(dataset_name, row_count, size_bytes, columns=None, null_counts=None, **kwargs):
+    """Log dataset output metadata.
+
+    Args:
+        dataset_name: Name of the dataset
+        row_count: Number of rows
+        size_bytes: Size in bytes
+        columns: List of column names (only count is logged, not names)
+        null_counts: Deprecated, ignored
+    """
     _append_csv("data_outputs.csv", {
         "timestamp": datetime.now().isoformat(),
         "run_id": os.environ.get('RUN_ID', 'unknown'),
         "dataset": dataset_name,
         "rows": row_count,
         "size_bytes": size_bytes,
-        "columns": ",".join(columns) if columns else "",
-        "null_counts": str(null_counts) if null_counts else ""
-    }, ["timestamp", "run_id", "dataset", "rows", "size_bytes", "columns", "null_counts"])
+        "column_count": len(columns) if columns else 0,
+    }, ["timestamp", "run_id", "dataset", "rows", "size_bytes", "column_count"])
 
 
 def log_run_start():
