@@ -2,7 +2,7 @@ import json
 import hashlib
 from pathlib import Path
 from deltalake import DeltaTable
-from .environment import get_data_dir, is_cloud_mode
+from .environment import get_data_dir, _is_cloud_mode
 from .r2 import get_delta_table_uri, get_storage_options, upload_bytes, download_bytes, get_connector_name
 
 
@@ -22,16 +22,22 @@ def sync_metadata(dataset_name: str, metadata: dict) -> bool:
 
     Returns True if metadata was synced, False if no changes detected.
     """
-    if 'id' not in metadata:
-        raise ValueError("Missing required field: 'id'")
     if 'title' not in metadata:
         raise ValueError("Missing required field: 'title'")
+    if 'description' not in metadata:
+        raise ValueError("Missing required field: 'description'")
+    if 'column_descriptions' not in metadata:
+        raise ValueError("Missing required field: 'column_descriptions'")
+
+    # id is always derived from dataset_name (ignore any passed id)
+    metadata = {k: v for k, v in metadata.items() if k != 'id'}
+    metadata['id'] = dataset_name
 
     # Compute hash of new metadata
     new_hash = _compute_metadata_hash(metadata)
 
     # Load existing hash
-    if is_cloud_mode():
+    if _is_cloud_mode():
         old_state_bytes = download_bytes(_metadata_state_key(dataset_name))
         old_state = json.loads(old_state_bytes.decode()) if old_state_bytes else {}
     else:
@@ -50,7 +56,7 @@ def sync_metadata(dataset_name: str, metadata: dict) -> bool:
     else:
         print(f"Syncing metadata for {dataset_name} (new, hash: {new_hash})")
 
-    if is_cloud_mode():
+    if _is_cloud_mode():
         table_uri = get_delta_table_uri(dataset_name)
         dt = DeltaTable(table_uri, storage_options=get_storage_options())
     else:
@@ -71,7 +77,7 @@ def sync_metadata(dataset_name: str, metadata: dict) -> bool:
 
     # Save new hash
     new_state = {"hash": new_hash}
-    if is_cloud_mode():
+    if _is_cloud_mode():
         upload_bytes(json.dumps(new_state).encode(), _metadata_state_key(dataset_name))
     else:
         state_dir = Path(get_data_dir()) / "state"
@@ -82,5 +88,3 @@ def sync_metadata(dataset_name: str, metadata: dict) -> bool:
     return True
 
 
-# Keep publish as an alias for backwards compatibility
-publish = sync_metadata

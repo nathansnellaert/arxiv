@@ -7,7 +7,7 @@ from typing import Optional
 _s3_client = None
 
 
-def is_cloud_mode() -> bool:
+def _is_cloud_mode() -> bool:
     return os.environ.get('CI', '').lower() == 'true'
 
 
