@@ -1,7 +1,7 @@
 """arXiv metadata harvest via OAI-PMH with date-based partitioning.
 
 - Uses T-2 (day before yesterday) for timezone safety
-- Saves parquet per day: papers_YYYY-MM-DD.parquet
+- Saves parquet per day: raw/papers/{YYYY-MM-DD}.parquet
 - Tracks fetched_dates in state for transform to diff against
 """
 import xml.etree.ElementTree as ET
@@ -11,8 +11,10 @@ import httpx
 import pyarrow as pa
 from subsets_utils import get, load_state, save_state, save_raw_parquet
 
-BASE_URL = "https://export.arxiv.org/oai2"
+BASE_URL = "https://oaipmh.arxiv.org/oai"
 GH_ACTIONS_MAX_RUN_SECONDS = 5.5 * 60 * 60
+# arXiv OAI-PMH earliest datestamp (from Identify response)
+EARLIEST_DATE = date(2005, 9, 16)
 
 NS = {
     'oai': 'http://www.openarchives.org/OAI/2.0/',
@@ -156,7 +158,7 @@ def run() -> bool:
     fetched_dates = set(state.get("fetched_dates", []))
 
     target_end = date.today() - timedelta(days=2)  # T-2 for timezone safety
-    start_date = date.fromisoformat(last_fetched) + timedelta(days=1) if last_fetched else date(1991, 1, 1)
+    start_date = date.fromisoformat(last_fetched) + timedelta(days=1) if last_fetched else EARLIEST_DATE
 
     if start_date > target_end:
         print(f"  Up to date (last: {last_fetched})")

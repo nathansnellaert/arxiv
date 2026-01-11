@@ -1,32 +1,17 @@
-import argparse
-import sys
-from subsets_utils import validate_environment
+from subsets_utils import DAG, validate_environment
+from nodes import oai_harvest, papers
 
-from ingest import oai_harvest
-from transforms import papers
+
+workflow = DAG({
+    oai_harvest.run: [],
+    papers.run: [oai_harvest.run],
+})
 
 
 def main():
-    parser = argparse.ArgumentParser(description="arXiv Comprehensive Connector")
-    parser.add_argument("--ingest-only", action="store_true")
-    parser.add_argument("--transform-only", action="store_true")
-    args = parser.parse_args()
-
     validate_environment()
-
-    needs_continuation = False
-
-    if not args.transform_only:
-        print("\n=== Ingest ===")
-        needs_continuation = oai_harvest.run()
-
-    if not args.ingest_only:
-        print("\n=== Transform ===")
-        papers.run()
-
-    if needs_continuation:
-        print("\nExiting with code 2 to signal continuation needed")
-        sys.exit(2)
+    workflow.run()
+    workflow.save_state()
 
 
 if __name__ == "__main__":

@@ -1,13 +1,13 @@
-"""Transform arXiv metadata into papers dataset (incremental with DuckDB).
+"""Transform arXiv metadata into papers dataset.
 
 - Diffs ingest state vs transform state to find new dates
 - Uses DuckDB for efficient transformation
 - Merges to Delta table by ID
 """
 import duckdb
-from subsets_utils import load_state, save_state, upload_data, sync_metadata
+import pyarrow as pa
+from subsets_utils import load_state, save_state, upload_data, sync_metadata, validate
 from subsets_utils.duckdb import raw
-from .test import test
 
 METADATA = {
     "title": "arXiv Papers",
@@ -15,13 +15,28 @@ METADATA = {
 }
 
 
+def test(table: pa.Table) -> None:
+    """Validate arxiv papers batch."""
+    validate(table, {
+        "columns": {
+            "id": "string",
+            "title": "string",
+            "abstract": "string",
+            "authors": "string",
+            "primary_category": "string",
+            "created": "string",
+        },
+        "not_null": ["id", "title", "created", "primary_category"],
+    })
+
+
 def run():
     """Transform new dates incrementally."""
-    print("  Transforming arXiv papers...")
+    print("Transforming arXiv papers...")
 
     # Diff ingest vs transform state
     ingest_state = load_state("oai_harvest")
-    transform_state = load_state("transform_papers")
+    transform_state = load_state("papers")
 
     fetched = set(ingest_state.get("fetched_dates", []))
     transformed = set(transform_state.get("transformed_dates", []))
@@ -51,7 +66,7 @@ def run():
 
     # Update state with all new dates
     transformed.update(new_dates)
-    save_state("transform_papers", {"transformed_dates": sorted(transformed)})
+    save_state("papers", {"transformed_dates": sorted(transformed)})
 
     sync_metadata("arxiv_papers", METADATA)
     print("  Done!")
